@@ -126,6 +126,35 @@ func (*SqlParseSuite) TestCustomTerminator(c *C) {
 	}
 }
 
+func (*SqlParseSuite) TestDependsDirective(c *C) {
+	// Directives are direction agnostic and may repeat.
+	sql := `-- +migrate Depends 1_initial.sql 2_record.sql
+-- +migrate Up
+CREATE TABLE post (id int);
+
+-- +migrate Depends 3_extra.sql
+-- +migrate Down
+DROP TABLE post;
+`
+	migration, err := ParseMigration(strings.NewReader(sql))
+	c.Assert(err, IsNil)
+	c.Assert(migration.Depends, DeepEquals, []string{
+		"1_initial.sql", "2_record.sql", "3_extra.sql",
+	})
+	c.Assert(migration.UpStatements, HasLen, 1)
+	c.Assert(migration.DownStatements, HasLen, 1)
+}
+
+func (*SqlParseSuite) TestDependsDirectiveRequiresIds(c *C) {
+	sql := `-- +migrate Depends
+-- +migrate Up
+SELECT 1;
+`
+	_, err := ParseMigration(strings.NewReader(sql))
+	c.Assert(err, NotNil)
+	c.Assert(strings.Contains(err.Error(), "Depends"), Equals, true)
+}
+
 var functxt = `-- +migrate Up
 CREATE TABLE IF NOT EXISTS histories (
   id                BIGSERIAL  PRIMARY KEY,

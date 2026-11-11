@@ -32,6 +32,7 @@ linters:
             - github.com/mitchellh/cli
             - github.com/olekukonko/tablewriter
             - github.com/rubenv/sql-migrate
+            - modernc.org/sqlite
             - gopkg.in/check.v1
             - gopkg.in/yaml.v2
     exhaustive:

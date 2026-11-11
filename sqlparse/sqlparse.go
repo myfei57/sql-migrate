@@ -11,6 +11,7 @@ import (
 const (
 	sqlCmdPrefix        = "-- +migrate "
 	optionNoTransaction = "notransaction"
+	commandDepends      = "Depends"
 )
 
 type ParsedMigration struct {
@@ -19,6 +20,10 @@ type ParsedMigration struct {
 
 	DisableTransactionUp   bool
 	DisableTransactionDown bool
+
+	// Depends holds the full migration ids that this migration declares as
+	// prerequisites through "-- +migrate Depends" directives.
+	Depends []string
 }
 
 // LineSeparator can be used to split migrations by an exact line match. This line
@@ -166,6 +171,12 @@ func ParseMigration(r io.ReadSeeker) (*ParsedMigration, error) {
 					statementEnded = ignoreSemicolons
 					ignoreSemicolons = false
 				}
+
+			case commandDepends:
+				if len(cmd.Options) == 0 {
+					return nil, fmt.Errorf("ERROR: %s directive requires at least one migration id", commandDepends)
+				}
+				p.Depends = append(p.Depends, cmd.Options...)
 			}
 		}
 

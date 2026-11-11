@@ -131,6 +131,13 @@ type Migration struct {
 
 	DisableTransactionUp   bool
 	DisableTransactionDown bool
+
+	// Depends optionally lists the full migration ids that must be applied
+	// before this migration. Dependencies are evaluated from this frozen
+	// metadata only; migration SQL is never parsed to infer dependencies.
+	// When every migration in a source leaves Depends empty, the legacy
+	// filename based Less ordering is used unchanged.
+	Depends []string
 }
 
 func (m Migration) Less(other *Migration) bool {
@@ -431,6 +438,9 @@ func ParseMigration(id string, r io.ReadSeeker) (*Migration, error) {
 	m.DisableTransactionUp = parsed.DisableTransactionUp
 	m.DisableTransactionDown = parsed.DisableTransactionDown
 
+	// Take a private copy so the parsed metadata stays immutable once loaded.
+	m.Depends = append([]string(nil), parsed.Depends...)
+
 	return m, nil
 }
 
@@ -623,20 +633,43 @@ func (ms MigrationSet) PlanMigrationToVersion(db *sql.DB, dialect string, m Migr
 
 // A common method to plan a migration.
 func (ms MigrationSet) planMigrationCommon(db *sql.DB, dialect string, m MigrationSource, dir MigrationDirection, max int, version int64) ([]*PlannedMigration, *gorp.DbMap, error) {
-	dbMap, err := ms.getMigrationDbMap(db, dialect)
+	dbMap, migrations, existingMigrations, err := ms.loadPlanningState(db, dialect, m)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	migrations, err := m.FindMigrations()
+	graph, err := loadMigrationGraph(migrations)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	if !graph.hasEdges {
+		// Sources without dependency metadata keep the exact legacy filename
+		// based planning behavior, including bytes and ordering.
+		planned, err := ms.planMigrationLegacy(migrations, existingMigrations, dir, max, version)
+		return planned, dbMap, err
+	}
+
+	return ms.planMigrationWithGraph(dbMap, graph, existingMigrations, dir, max, version)
+}
+
+// loadPlanningState opens the migration table, loads the source and the
+// applied migration records and runs the unknown-migration safety check.
+func (ms MigrationSet) loadPlanningState(db *sql.DB, dialect string, m MigrationSource) (*gorp.DbMap, []*Migration, []*Migration, error) {
+	dbMap, err := ms.getMigrationDbMap(db, dialect)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	migrations, err := m.FindMigrations()
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
 	var migrationRecords []MigrationRecord
 	_, err = dbMap.Select(&migrationRecords, fmt.Sprintf("SELECT * FROM %s", dbMap.Dialect.QuotedTableForQuery(ms.SchemaName, ms.getTableName())))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// Sort migrations that have been run by Id.
@@ -657,11 +690,17 @@ func (ms MigrationSet) planMigrationCommon(db *sql.DB, dialect string, m Migrati
 		}
 		for _, existingMigration := range existingMigrations {
 			if _, ok := migrationsSearch[existingMigration.Id]; !ok {
-				return nil, nil, newPlanError(existingMigration, "unknown migration in database")
+				return nil, nil, nil, newPlanError(existingMigration, "unknown migration in database")
 			}
 		}
 	}
 
+	return dbMap, migrations, existingMigrations, nil
+}
+
+// planMigrationLegacy keeps the original numeric-prefix based behavior for
+// sources that do not declare any dependency metadata.
+func (MigrationSet) planMigrationLegacy(migrations, existingMigrations []*Migration, dir MigrationDirection, max int, version int64) ([]*PlannedMigration, error) {
 	// Get last migration that was run
 	record := &Migration{}
 	if len(existingMigrations) > 0 {
@@ -685,7 +724,7 @@ func (ms MigrationSet) planMigrationCommon(db *sql.DB, dialect string, m Migrati
 		for targetIndex < len(toApply) {
 			tempVersion := toApply[targetIndex].VersionInt()
 			if dir == Up && tempVersion > version || dir == Down && tempVersion < version {
-				return nil, nil, newPlanError(&Migration{}, fmt.Errorf("unknown migration with version id %d in database", version).Error())
+				return nil, newPlanError(&Migration{}, fmt.Errorf("unknown migration with version id %d in database", version).Error())
 			}
 			if tempVersion == version {
 				toApplyCount = targetIndex + 1
@@ -694,7 +733,7 @@ func (ms MigrationSet) planMigrationCommon(db *sql.DB, dialect string, m Migrati
 			targetIndex++
 		}
 		if targetIndex == len(toApply) {
-			return nil, nil, newPlanError(&Migration{}, fmt.Errorf("unknown migration with version id %d in database", version).Error())
+			return nil, newPlanError(&Migration{}, fmt.Errorf("unknown migration with version id %d in database", version).Error())
 		}
 	} else if max > 0 && max < toApplyCount {
 		toApplyCount = max
@@ -716,7 +755,216 @@ func (ms MigrationSet) planMigrationCommon(db *sql.DB, dialect string, m Migrati
 		}
 	}
 
-	return result, dbMap, nil
+	return result, nil
+}
+
+// planMigrationWithGraph plans from frozen dependency metadata. Ordering comes
+// from the stable topological order, so numeric id prefixes can never hide a
+// missing prerequisite and applied-state holes are filled dependency-first.
+func (MigrationSet) planMigrationWithGraph(dbMap *gorp.DbMap, graph *migrationGraph, existingMigrations []*Migration, dir MigrationDirection, max int, version int64) ([]*PlannedMigration, *gorp.DbMap, error) {
+	applied := make(map[string]struct{}, len(existingMigrations))
+	for _, migration := range existingMigrations {
+		applied[migration.Id] = struct{}{}
+	}
+
+	var sequence []*Migration
+	switch dir {
+	case Up:
+		sequence = graph.upSequence(applied)
+	case Down:
+		sequence = graph.downSequence(applied)
+	default:
+		panic("Not possible")
+	}
+
+	if version >= 0 {
+		targetIndex := 0
+		for targetIndex < len(sequence) {
+			tempVersion := sequence[targetIndex].VersionInt()
+			if dir == Up && tempVersion > version || dir == Down && tempVersion < version {
+				return nil, nil, newPlanError(&Migration{}, fmt.Errorf("unknown migration with version id %d in database", version).Error())
+			}
+			if tempVersion == version {
+				sequence = sequence[:targetIndex+1]
+				break
+			}
+			targetIndex++
+		}
+		if targetIndex == len(sequence) {
+			return nil, nil, newPlanError(&Migration{}, fmt.Errorf("unknown migration with version id %d in database", version).Error())
+		}
+	} else if max > 0 && max < len(sequence) {
+		// A prefix of a topological order is always a legal set: every kept
+		// node keeps its dependencies before itself.
+		sequence = sequence[:max]
+	}
+
+	switch dir {
+	case Up:
+		if err := checkUpExecutable(graph, sequence, applied); err != nil {
+			return nil, nil, err
+		}
+	case Down:
+		if err := checkDownExecutable(graph, sequence, applied); err != nil {
+			return nil, nil, err
+		}
+	default:
+		panic("Not possible")
+	}
+
+	return toPlannedMigrations(sequence, dir), dbMap, nil
+}
+
+// TargetPlan is the result of planning against explicit migration targets.
+type TargetPlan struct {
+	// Migrations holds the ordered, executable migration sequence.
+	Migrations []*PlannedMigration
+
+	// Complete reports whether every requested target is covered by the plan.
+	// It is false when Max cut the plan short: Migrations then contains the
+	// longest executable prefix rather than an invalid truncated closure, and
+	// another planning/execution round is required to reach the targets.
+	Complete bool
+}
+
+// PlanTargets plans the migrations needed to reach (Up) or remove (Down) the
+// given target migration ids.
+//
+// For Up, the full transitive dependency closure of the targets is computed
+// from the frozen migration metadata and ordered through a stable
+// topological sort. For Down, exactly the selected applied migrations are
+// removed in reverse topological order; the plan is rejected while an
+// applied migration outside the selection still depends on one of them.
+//
+// Pass max 0 for no limit. A positive max never produces an illegal set: it
+// only truncates the plan to its longest executable prefix, reported through
+// TargetPlan.Complete.
+func PlanTargets(db *sql.DB, dialect string, m MigrationSource, dir MigrationDirection, targets []string, max int) (*TargetPlan, *gorp.DbMap, error) {
+	return migSet.PlanTargets(db, dialect, m, dir, targets, max)
+}
+
+// PlanTargets plans the migrations needed to reach (Up) or remove (Down) the
+// given target migration ids.
+func (ms MigrationSet) PlanTargets(db *sql.DB, dialect string, m MigrationSource, dir MigrationDirection, targets []string, max int) (*TargetPlan, *gorp.DbMap, error) {
+	dbMap, migrations, existingMigrations, err := ms.loadPlanningState(db, dialect, m)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	graph, err := loadMigrationGraph(migrations)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	applied := make(map[string]struct{}, len(existingMigrations))
+	for _, migration := range existingMigrations {
+		applied[migration.Id] = struct{}{}
+	}
+
+	targetSet := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		if _, exists := graph.nodes[target]; !exists {
+			return nil, nil, &DependencyError{Reason: DependencyTarget, MigrationId: target}
+		}
+		targetSet[target] = struct{}{}
+	}
+
+	var sequence []*Migration
+	switch dir {
+	case Up:
+		closure, err := graph.upClosure(targets)
+		if err != nil {
+			return nil, nil, err
+		}
+		pending := make(map[string]struct{}, len(closure))
+		for id := range closure {
+			if _, isApplied := applied[id]; !isApplied {
+				pending[id] = struct{}{}
+			}
+		}
+		sequence = graph.filterTopological(pending)
+		if err := checkUpExecutable(graph, sequence, applied); err != nil {
+			return nil, nil, err
+		}
+	case Down:
+		for target := range targetSet {
+			if _, isApplied := applied[target]; !isApplied {
+				return nil, nil, &DependencyError{Reason: DependencyNotApplied, MigrationId: target}
+			}
+		}
+		if err := graph.validateDownRemoval(targetSet, applied); err != nil {
+			return nil, nil, err
+		}
+		sequence = graph.downSequence(targetSet)
+		if err := checkDownExecutable(graph, sequence, applied); err != nil {
+			return nil, nil, err
+		}
+	default:
+		panic("Not possible")
+	}
+
+	complete := true
+	if max > 0 && max < len(sequence) {
+		sequence = sequence[:max]
+		complete = false
+	}
+	if complete {
+		complete = targetsReachable(dir, targetSet, applied, sequence)
+	}
+
+	return &TargetPlan{
+		Migrations: toPlannedMigrations(sequence, dir),
+		Complete:   complete,
+	}, dbMap, nil
+}
+
+// targetsReachable verifies that every target is either already in the
+// applied state (Up only) or present in the final planned sequence.
+func targetsReachable(dir MigrationDirection, targetSet, applied map[string]struct{}, sequence []*Migration) bool {
+	planned := make(map[string]struct{}, len(sequence))
+	for _, migration := range sequence {
+		planned[migration.Id] = struct{}{}
+	}
+
+	for target := range targetSet {
+		if _, isPlanned := planned[target]; isPlanned {
+			continue
+		}
+		if dir == Up {
+			if _, isApplied := applied[target]; isApplied {
+				continue
+			}
+		}
+		return false
+	}
+	return true
+}
+
+// ExecTargets plans and executes the migrations needed to reach (Up) or
+// remove (Down) the given target migration ids. Migrations on the same
+// database run sequentially.
+func ExecTargets(db *sql.DB, dialect string, m MigrationSource, dir MigrationDirection, targets []string, max int) (int, error) {
+	return ExecTargetsContext(context.Background(), db, dialect, m, dir, targets, max)
+}
+
+// ExecTargetsContext plans and executes target migrations with an input context.
+func ExecTargetsContext(ctx context.Context, db *sql.DB, dialect string, m MigrationSource, dir MigrationDirection, targets []string, max int) (int, error) {
+	return migSet.ExecTargetsContext(ctx, db, dialect, m, dir, targets, max)
+}
+
+// ExecTargets plans and executes the migrations needed to reach (Up) or
+// remove (Down) the given target migration ids.
+func (ms MigrationSet) ExecTargets(db *sql.DB, dialect string, m MigrationSource, dir MigrationDirection, targets []string, max int) (int, error) {
+	return ms.ExecTargetsContext(context.Background(), db, dialect, m, dir, targets, max)
+}
+
+// ExecTargetsContext plans and executes target migrations with an input context.
+func (ms MigrationSet) ExecTargetsContext(ctx context.Context, db *sql.DB, dialect string, m MigrationSource, dir MigrationDirection, targets []string, max int) (int, error) {
+	plan, dbMap, err := ms.PlanTargets(db, dialect, m, dir, targets, max)
+	if err != nil {
+		return 0, err
+	}
+	return ms.applyMigrations(ctx, dir, plan.Migrations, dbMap)
 }
 
 // Skip a set of migrations

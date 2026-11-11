@@ -530,6 +530,17 @@ func (ms MigrationSet) ExecVersionContext(ctx context.Context, db *sql.DB, diale
 	return ms.applyMigrations(ctx, dir, migrations, dbMap)
 }
 
+// trimStatementSuffix removes the trailing newline, whitespace and semicolon
+// added by the migration parser before sending a statement to the database.
+// Keeping this in a single function guarantees that regular execution and
+// frozen plan execution send byte-identical SQL to the driver.
+func trimStatementSuffix(stmt string) string {
+	stmt = strings.TrimSuffix(stmt, "\n")
+	stmt = strings.TrimSuffix(stmt, " ")
+	stmt = strings.TrimSuffix(stmt, ";")
+	return stmt
+}
+
 // Applies the planned migrations and returns the number of applied migrations.
 func (MigrationSet) applyMigrations(ctx context.Context, dir MigrationDirection, migrations []*PlannedMigration, dbMap *gorp.DbMap) (int, error) {
 	applied := 0
@@ -549,9 +560,7 @@ func (MigrationSet) applyMigrations(ctx context.Context, dir MigrationDirection,
 
 		for _, stmt := range migration.Queries {
 			// remove the semicolon from stmt, fix ORA-00922 issue in database oracle
-			stmt = strings.TrimSuffix(stmt, "\n")
-			stmt = strings.TrimSuffix(stmt, " ")
-			stmt = strings.TrimSuffix(stmt, ";")
+			stmt = trimStatementSuffix(stmt)
 			if _, err := executor.Exec(stmt); err != nil {
 				if trans, ok := executor.(*gorp.Transaction); ok {
 					_ = trans.Rollback()
@@ -639,6 +648,18 @@ func (ms MigrationSet) planMigrationCommon(db *sql.DB, dialect string, m Migrati
 		return nil, nil, err
 	}
 
+	result, err := ms.planFromRecords(migrations, migrationRecords, dir, max, version)
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, dbMap, nil
+}
+
+// planFromRecords computes the migrations to apply from the migrations found
+// in the source and the migration records already present in the database. It
+// performs no I/O and is shared by the regular planning path and the read-only
+// frozen plan build path.
+func (ms MigrationSet) planFromRecords(migrations []*Migration, migrationRecords []MigrationRecord, dir MigrationDirection, max int, version int64) ([]*PlannedMigration, error) {
 	// Sort migrations that have been run by Id.
 	existingMigrations := make([]*Migration, 0, len(migrationRecords))
 	for _, migrationRecord := range migrationRecords {
@@ -657,7 +678,7 @@ func (ms MigrationSet) planMigrationCommon(db *sql.DB, dialect string, m Migrati
 		}
 		for _, existingMigration := range existingMigrations {
 			if _, ok := migrationsSearch[existingMigration.Id]; !ok {
-				return nil, nil, newPlanError(existingMigration, "unknown migration in database")
+				return nil, newPlanError(existingMigration, "unknown migration in database")
 			}
 		}
 	}
@@ -685,7 +706,7 @@ func (ms MigrationSet) planMigrationCommon(db *sql.DB, dialect string, m Migrati
 		for targetIndex < len(toApply) {
 			tempVersion := toApply[targetIndex].VersionInt()
 			if dir == Up && tempVersion > version || dir == Down && tempVersion < version {
-				return nil, nil, newPlanError(&Migration{}, fmt.Errorf("unknown migration with version id %d in database", version).Error())
+				return nil, newPlanError(&Migration{}, fmt.Errorf("unknown migration with version id %d in database", version).Error())
 			}
 			if tempVersion == version {
 				toApplyCount = targetIndex + 1
@@ -694,7 +715,7 @@ func (ms MigrationSet) planMigrationCommon(db *sql.DB, dialect string, m Migrati
 			targetIndex++
 		}
 		if targetIndex == len(toApply) {
-			return nil, nil, newPlanError(&Migration{}, fmt.Errorf("unknown migration with version id %d in database", version).Error())
+			return nil, newPlanError(&Migration{}, fmt.Errorf("unknown migration with version id %d in database", version).Error())
 		}
 	} else if max > 0 && max < toApplyCount {
 		toApplyCount = max
@@ -716,7 +737,7 @@ func (ms MigrationSet) planMigrationCommon(db *sql.DB, dialect string, m Migrati
 		}
 	}
 
-	return result, dbMap, nil
+	return result, nil
 }
 
 // Skip a set of migrations

@@ -317,6 +317,74 @@ CREATE UNIQUE INDEX CONCURRENTLY people_unique_id_idx ON people (id);
 DROP INDEX people_unique_id_idx;
 ```
 
+## Assertion blocks (AssertBefore / AssertAfter)
+
+Migrations can carry named SQL checks that gate whether a migration is allowed
+to proceed or to be marked as applied. An assertion block uses its own explicit
+begin/end markers and contains a single check query:
+
+```sql
+-- +migrate Up
+-- +migrate AssertBeforeBegin table_absent
+SELECT NOT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'people');
+-- +migrate AssertBeforeEnd
+
+CREATE TABLE people (id int);
+
+-- +migrate AssertAfterBegin table_created
+SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'people');
+-- +migrate AssertAfterEnd
+
+-- +migrate Down
+-- +migrate AssertBeforeBegin table_present
+SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'people');
+-- +migrate AssertBeforeEnd
+DROP TABLE people;
+-- +migrate AssertAfterBegin table_gone
+SELECT NOT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'people');
+-- +migrate AssertAfterEnd
+```
+
+The four markers are `AssertBeforeBegin <name>` / `AssertBeforeEnd` and
+`AssertAfterBegin <name>` / `AssertAfterEnd`. They only work inside an `Up` or
+`Down` section, cannot be nested inside each other or inside
+`StatementBegin`/`StatementEnd`, and assertion names must be unique within a
+direction. Duplicate names, unclosed or mismatched blocks, and empty blocks are
+rejected when the migration is parsed, before anything is executed. Lines that
+look like directives but appear inside SQL strings or block comments are
+treated as ordinary SQL text.
+
+A check query is successful only when it returns **exactly one row with exactly
+one column, whose value is non-NULL and scans to boolean true**. No rows, more
+than one row, more than one column, NULL, false, a scan error, or a query error
+all fail the migration. The returned error always contains the migration id and
+the assertion name, and is additionally available as an `*migrate.AssertionError`.
+
+Execution order and transaction behavior:
+
+- Assertions belong to a direction. Only the assertions of the direction that is
+  actually executed are evaluated; already-applied migrations that are skipped
+  and migrations recorded through `Skip` never run assertions.
+- For a normal (transactional) migration, the before-assertions, the migration
+  statements, the after-assertions and the migration record write all run in one
+  transaction. A failed before- or after-assertion rolls the whole migration
+  back and no record is written.
+- For a `notransaction` migration, statements are committed as they run. A
+  failed before-assertion still means nothing executed; a failed
+  after-assertion returns an `AssertionError` with `Partial == true` whose
+  message states that the changes were already applied and not rolled back, that
+  no success record was written, and that the database must be repaired
+  manually — the migration is not claimed to be reversible or safe to re-run.
+
+Check SQL is trusted migration content, exactly like the statements in `Up` and
+`Down`. There is no keyword-based read-only enforcement: a check is allowed to
+call functions with side effects or to run DML (for example an
+`INSERT ... RETURNING` query). Each check runs with the caller's context, is
+bounded by the package-level `migrate.AssertionTimeout` (default 30s), reads at
+most two rows (one is required, a second already proves failure) and requires a
+single column; rows are always checked for errors and closed so connections are
+released.
+
 ## Embedding migrations with [embed](https://pkg.go.dev/embed)
 
 If you like your Go applications self-contained (that is: a single binary): use [embed](https://pkg.go.dev/embed) to embed the migration files.

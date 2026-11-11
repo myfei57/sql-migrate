@@ -129,6 +129,13 @@ type Migration struct {
 	Up   []string
 	Down []string
 
+	// Named assertion checks parsed from AssertBefore/AssertAfter blocks,
+	// grouped by the direction they belong to and kept in source order.
+	AssertBeforeUp   []sqlparse.Assertion
+	AssertAfterUp    []sqlparse.Assertion
+	AssertBeforeDown []sqlparse.Assertion
+	AssertAfterDown  []sqlparse.Assertion
+
 	DisableTransactionUp   bool
 	DisableTransactionDown bool
 }
@@ -168,6 +175,12 @@ type PlannedMigration struct {
 
 	DisableTransaction bool
 	Queries            []string
+
+	// Assertions selected for the planned direction. BeforeAssertions run
+	// before Queries, AfterAssertions run after Queries but before the
+	// migration record is written.
+	BeforeAssertions []sqlparse.Assertion
+	AfterAssertions  []sqlparse.Assertion
 }
 
 type byId []*Migration
@@ -428,6 +441,11 @@ func ParseMigration(id string, r io.ReadSeeker) (*Migration, error) {
 	m.Up = parsed.UpStatements
 	m.Down = parsed.DownStatements
 
+	m.AssertBeforeUp = parsed.AssertBeforeUp
+	m.AssertAfterUp = parsed.AssertAfterUp
+	m.AssertBeforeDown = parsed.AssertBeforeDown
+	m.AssertAfterDown = parsed.AssertAfterDown
+
 	m.DisableTransactionUp = parsed.DisableTransactionUp
 	m.DisableTransactionDown = parsed.DisableTransactionDown
 
@@ -547,6 +565,16 @@ func (MigrationSet) applyMigrations(ctx context.Context, dir MigrationDirection,
 			executor = e.WithContext(ctx)
 		}
 
+		// Before-assertions run before any migration statement. A failure
+		// therefore leaves the database untouched; a transactional migration
+		// simply rolls its (still empty) transaction back.
+		if err := runAssertions(ctx, executor, migration, AssertBefore, migration.BeforeAssertions); err != nil {
+			if trans, ok := executor.(*gorp.Transaction); ok {
+				_ = trans.Rollback()
+			}
+			return applied, err
+		}
+
 		for _, stmt := range migration.Queries {
 			// remove the semicolon from stmt, fix ORA-00922 issue in database oracle
 			stmt = strings.TrimSuffix(stmt, "\n")
@@ -559,6 +587,25 @@ func (MigrationSet) applyMigrations(ctx context.Context, dir MigrationDirection,
 
 				return applied, newTxError(migration, err)
 			}
+		}
+
+		// After-assertions gate the record write (and the commit). For a
+		// transactional migration everything shares one transaction, so a
+		// failure rolls all migration changes back. A notransaction migration
+		// has already committed its statements: the failure is reported as a
+		// partial application, no success record is written and nothing is
+		// rolled back automatically.
+		if err := runAssertions(ctx, executor, migration, AssertAfter, migration.AfterAssertions); err != nil {
+			if trans, ok := executor.(*gorp.Transaction); ok {
+				_ = trans.Rollback()
+				return applied, err
+			}
+
+			var assertionErr *AssertionError
+			if errors.As(err, &assertionErr) {
+				assertionErr.Partial = true
+			}
+			return applied, err
 		}
 
 		switch dir {
@@ -705,12 +752,16 @@ func (ms MigrationSet) planMigrationCommon(db *sql.DB, dialect string, m Migrati
 			result = append(result, &PlannedMigration{
 				Migration:          v,
 				Queries:            v.Up,
+				BeforeAssertions:   v.AssertBeforeUp,
+				AfterAssertions:    v.AssertAfterUp,
 				DisableTransaction: v.DisableTransactionUp,
 			})
 		case Down:
 			result = append(result, &PlannedMigration{
 				Migration:          v,
 				Queries:            v.Down,
+				BeforeAssertions:   v.AssertBeforeDown,
+				AfterAssertions:    v.AssertAfterDown,
 				DisableTransaction: v.DisableTransactionDown,
 			})
 		}
@@ -811,6 +862,8 @@ func ToCatchup(migrations, existingMigrations []*Migration, lastRun *Migration) 
 			missing = append(missing, &PlannedMigration{
 				Migration:          migration,
 				Queries:            migration.Up,
+				BeforeAssertions:   migration.AssertBeforeUp,
+				AfterAssertions:    migration.AssertAfterUp,
 				DisableTransaction: migration.DisableTransactionUp,
 			})
 		}

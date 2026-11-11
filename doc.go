@@ -182,6 +182,36 @@ Normally each migration is run within a transaction in order to guarantee that i
 	-- +migrate Down
 	DROP INDEX people_unique_id_idx;
 
+# Assertion blocks
+
+Named AssertBefore/AssertAfter blocks gate a migration on a single check query
+delimited by independent begin/end markers:
+
+	-- +migrate Up
+	-- +migrate AssertBeforeBegin table_absent
+	SELECT NOT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'people');
+	-- +migrate AssertBeforeEnd
+	CREATE TABLE people (id int);
+	-- +migrate AssertAfterBegin table_created
+	SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'people');
+	-- +migrate AssertAfterEnd
+
+The check must return exactly one row with one non-NULL column scanning to
+boolean true; false, NULL, no rows, multiple rows/columns or any query error
+fail the migration with an AssertionError carrying the migration id and the
+assertion name. Duplicate names, unclosed/mismatched blocks and nesting with
+StatementBegin/End are rejected while parsing. Directive-looking lines inside
+SQL strings or block comments are ignored as commands.
+
+For transactional migrations the before-checks, statements, after-checks and
+the migration record share one transaction; any assertion failure rolls the
+migration back. For notransaction migrations an after-check failure reports a
+partial application: statements already committed, no success record written,
+no automatic rollback or re-run. Only the executed direction's assertions run,
+and skipped migrations run none. Check SQL is trusted migration content and may
+have side effects; each check is context-aware, timeout-bounded
+(AssertionTimeout), capped in result size, and always closes its rows.
+
 # Embedding migrations with packr
 
 If you like your Go applications self-contained (that is: a single binary): use packr (https://github.com/gobuffalo/packr) to embed the migration files.

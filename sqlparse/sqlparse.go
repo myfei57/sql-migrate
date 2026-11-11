@@ -19,6 +19,12 @@ type ParsedMigration struct {
 
 	DisableTransactionUp   bool
 	DisableTransactionDown bool
+
+	// UpSources and DownSources hold the originating file position and
+	// IncludeFragment call chain for each parallel entry in UpStatements and
+	// DownStatements. They are nil for migrations parsed without includes.
+	UpSources   []StatementSource
+	DownSources []StatementSource
 }
 
 // LineSeparator can be used to split migrations by an exact line match. This line

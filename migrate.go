@@ -95,6 +95,12 @@ func (e *TxError) Error() string {
 	return e.Err.Error() + " handling " + e.Migration.Id
 }
 
+// Unwrap exposes the underlying error so errors.As/Is can reach statement and
+// database driver errors.
+func (e *TxError) Unwrap() error {
+	return e.Err
+}
+
 // Set the name of the table used to store migration info.
 //
 // Should be called before any other call such as (Exec, ExecMax, ...).
@@ -131,6 +137,12 @@ type Migration struct {
 
 	DisableTransactionUp   bool
 	DisableTransactionDown bool
+
+	// UpSources and DownSources hold the originating file position and
+	// IncludeFragment call chain for each parallel entry in Up and Down.
+	// They are nil for migrations parsed without IncludeFragment annotations.
+	UpSources   []sqlparse.StatementSource
+	DownSources []sqlparse.StatementSource
 }
 
 func (m Migration) Less(other *Migration) bool {
@@ -168,6 +180,44 @@ type PlannedMigration struct {
 
 	DisableTransaction bool
 	Queries            []string
+	// Sources parallels Queries and records the originating file position and
+	// IncludeFragment chain for enriched error reporting. It may be nil.
+	Sources []sqlparse.StatementSource
+}
+
+// StatementError wraps a database execution error with the originating
+// statement position and IncludeFragment call chain, so failures point at the
+// original migration or fragment location rather than at expanded offsets.
+type StatementError struct {
+	// Migration is the root migration being applied.
+	Migration *Migration
+	// Source identifies the originating file, line and include chain.
+	Source sqlparse.StatementSource
+	// Err is the database driver error.
+	Err error
+}
+
+func (e *StatementError) Error() string {
+	location := e.Source.Ref.File
+	if e.Source.Ref.Line > 0 {
+		location = fmt.Sprintf("%s:%d", location, e.Source.Ref.Line)
+		if e.Source.Ref.Column > 0 {
+			location = fmt.Sprintf("%s:%d", location, e.Source.Ref.Column)
+		}
+	}
+	message := fmt.Sprintf("statement originating at %s failed: %s", location, e.Err.Error())
+	if len(e.Source.Chain) > 0 {
+		frames := make([]string, 0, len(e.Source.Chain))
+		for _, frame := range e.Source.Chain {
+			frames = append(frames, fmt.Sprintf("%s:%d", frame.File, frame.Line))
+		}
+		message = fmt.Sprintf("%s (include chain %s)", message, strings.Join(frames, " -> "))
+	}
+	return message
+}
+
+func (e *StatementError) Unwrap() error {
+	return e.Err
 }
 
 type byId []*Migration
@@ -547,7 +597,7 @@ func (MigrationSet) applyMigrations(ctx context.Context, dir MigrationDirection,
 			executor = e.WithContext(ctx)
 		}
 
-		for _, stmt := range migration.Queries {
+		for stmtIndex, stmt := range migration.Queries {
 			// remove the semicolon from stmt, fix ORA-00922 issue in database oracle
 			stmt = strings.TrimSuffix(stmt, "\n")
 			stmt = strings.TrimSuffix(stmt, " ")
@@ -555,6 +605,13 @@ func (MigrationSet) applyMigrations(ctx context.Context, dir MigrationDirection,
 			if _, err := executor.Exec(stmt); err != nil {
 				if trans, ok := executor.(*gorp.Transaction); ok {
 					_ = trans.Rollback()
+				}
+				if stmtIndex < len(migration.Sources) {
+					err = &StatementError{
+						Migration: migration.Migration,
+						Source:    migration.Sources[stmtIndex],
+						Err:       err,
+					}
 				}
 
 				return applied, newTxError(migration, err)
@@ -706,12 +763,14 @@ func (ms MigrationSet) planMigrationCommon(db *sql.DB, dialect string, m Migrati
 				Migration:          v,
 				Queries:            v.Up,
 				DisableTransaction: v.DisableTransactionUp,
+				Sources:            v.UpSources,
 			})
 		case Down:
 			result = append(result, &PlannedMigration{
 				Migration:          v,
 				Queries:            v.Down,
 				DisableTransaction: v.DisableTransactionDown,
+				Sources:            v.DownSources,
 			})
 		}
 	}
@@ -812,6 +871,7 @@ func ToCatchup(migrations, existingMigrations []*Migration, lastRun *Migration) 
 				Migration:          migration,
 				Queries:            migration.Up,
 				DisableTransaction: migration.DisableTransactionUp,
+				Sources:            migration.UpSources,
 			})
 		}
 	}
